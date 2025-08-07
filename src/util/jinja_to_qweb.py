@@ -447,7 +447,6 @@ def upgrade_jinja_fields(
 
 def verify_upgraded_jinja_fields(cr):
     env = get_env(cr)
-    cr.commit()
     cr.execute("SELECT DISTINCT(table_name) FROM _upgrade_jinja_to_qweb")
     for (table_name,) in cr.fetchall():
         field_errors = {}
