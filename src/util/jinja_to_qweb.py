@@ -447,6 +447,7 @@ def upgrade_jinja_fields(
 
 def verify_upgraded_jinja_fields(cr):
     env = get_env(cr)
+    cr.commit()
     cr.execute("SELECT DISTINCT(table_name) FROM _upgrade_jinja_to_qweb")
     for (table_name,) in cr.fetchall():
         field_errors = {}
@@ -476,11 +477,10 @@ def verify_upgraded_jinja_fields(cr):
             template_name,
             template_name_field,
             template_converted,
-        ) in ncr.fetchall():
+        ) in ncr:
             if model_name not in env:
                 # custom model not loaded yet. Ignore
                 continue
-            cr.commit()  # commit changes for the named cursor below
             model = env[model_name]
             record = model.with_context({"active_test": False}).search([], limit=1, order="id")
 
