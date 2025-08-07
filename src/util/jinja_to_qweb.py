@@ -476,10 +476,11 @@ def verify_upgraded_jinja_fields(cr):
             template_name,
             template_name_field,
             template_converted,
-        ) in ncr:
+        ) in ncr.fetchall():
             if model_name not in env:
                 # custom model not loaded yet. Ignore
                 continue
+            cr.commit()  # commit changes for the named cursor below
             model = env[model_name]
             record = model.with_context({"active_test": False}).search([], limit=1, order="id")
 
