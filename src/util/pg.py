@@ -32,6 +32,7 @@ except NameError:
 import psycopg2
 from psycopg2 import errorcodes, sql
 from psycopg2.extensions import quote_ident
+from psycopg2.extras import Json
 
 try:
     from odoo.modules import module as odoo_module
@@ -1351,6 +1352,83 @@ def create_m2m(cr, m2m, fk1, fk2, col1=None, col2=None):
     )
 
 
+def update_m2m_tables(cr, old_table, new_table, ignored_m2ms=()):
+    """
+    Update m2m table names and columns.
+
+    This function renames m2m tables still referring to `old_table`. It also updates
+    column names and constraints of those tables.
+
+    :param str old_table: former table name
+    :param str new_table: new table name
+    :param list(str) ignored_m2ms: explicit list of m2m tables to ignore
+
+    :meta private: exclude from online docs
+    """
+    assert isinstance(ignored_m2ms, (list, tuple))
+    if old_table == new_table or not version_gte("10.0"):
+        return
+    ignored_m2ms = set(ignored_m2ms)
+    for orig_m2m_table in get_m2m_tables(cr, new_table):
+        if orig_m2m_table in ignored_m2ms:
+            continue
+        m = re.match(r"^(\w+)_{0}_rel|{0}_(\w+)_rel$".format(re.escape(old_table)), orig_m2m_table)
+        if m:
+            m2m_table = "{}_{}_rel".format(*sorted([m.group(1) or m.group(2), new_table]))
+            # Due to the 63 chars limit in generated constraint names, for long table names the FK
+            # constraint is dropped when renaming the table. We need the constraint to correctly
+            # identify the FK targets. The FK constraints will be dropped and recreated below.
+            rename_table(cr, orig_m2m_table, m2m_table, remove_constraints=False)
+            _logger.info("Renamed m2m table %s to %s", orig_m2m_table, m2m_table)
+        else:
+            m2m_table = orig_m2m_table
+        for m2m_col in get_columns(cr, m2m_table).iter_unquoted():
+            col_info = target_of(cr, m2m_table, m2m_col)
+            if not col_info or col_info[0] != new_table or col_info[1] != "id":
+                continue
+            old_col, new_col = map("{}_id".format, [old_table, new_table])
+            if m2m_col != old_col:
+                _logger.warning(
+                    "Possibly missing rename: the column %s of m2m table %s references the table %s",
+                    m2m_col,
+                    m2m_table,
+                    new_table,
+                )
+                continue
+            old_constraint = col_info[2]
+            cr.execute(
+                """
+                SELECT c.confdeltype
+                  FROM pg_constraint c
+                  JOIN pg_class t
+                    ON c.conrelid = t.oid
+                 WHERE t.relname = %s
+                   AND c.conname = %s
+                """,
+                [m2m_table, old_constraint],
+            )
+            on_delete = cr.fetchone()[0]
+            query = format_query(
+                cr,
+                """
+                ALTER TABLE {m2m_table}
+              RENAME COLUMN {old_col} TO {new_col};
+
+                ALTER TABLE {m2m_table}
+            DROP CONSTRAINT {old_constraint},
+            ADD FOREIGN KEY ({new_col}) REFERENCES {new_table} (id) ON DELETE {del_action}
+                """,
+                m2m_table=m2m_table,
+                old_col=old_col,
+                new_col=new_col,
+                old_constraint=old_constraint,
+                new_table=new_table,
+                del_action=SQLStr("RESTRICT") if on_delete == "r" else SQLStr("CASCADE"),
+            )
+            cr.execute(query)
+            _logger.info("Renamed m2m column of table %s from %s to %s", m2m_table, old_col, new_col)
+
+
 def fixup_m2m(cr, m2m, fk1, fk2, col1=None, col2=None):
     if col1 is None:
         col1 = "%s_id" % fk1
@@ -1621,3 +1699,76 @@ def create_id_sequence(cr, table, set_as_default=True):
                 table=table_sql,
             )
         )
+
+
+def bulk_update_table(cr, table, columns, mapping, key_col="id"):
+    """
+    Update table based on mapping.
+
+    Each `mapping` entry defines the new values for the specified `columns` for the row(s)
+    whose `key_col` value matches the key.
+
+    .. example::
+
+       .. code-block:: python
+
+          # single column update
+          util.bulk_update_table(cr, "res_users", "active", {42: False, 27: True})
+
+          # multi-column update
+          util.bulk_update_table(
+              cr,
+              "res_users",
+              ["active", "password"],
+              {
+                  "admin": [True, "1234"],
+                  "demo": [True, "5678"],
+              },
+              key_col="login",
+          )
+
+    :param str table: table to update.
+    :param str | list(str) columns: columns spec for the update. It could be a single
+                                    column name or a list of column names. The `mapping`
+                                    must match the spec.
+    :param dict mapping: values to set, which must match the spec in `columns`,
+                         following the **same** order
+    :param str key_col: column used as key to get the values from `mapping` during the
+                        update.
+
+    .. warning::
+
+       The values in the mapping will be casted to the type of the target column.
+       This function is designed to update scalar values, avoid setting arrays or json
+       data via the mapping.
+    """
+    _validate_table(table)
+    if not columns or not mapping:
+        return
+
+    assert isinstance(mapping, dict)
+    if isinstance(columns, str):
+        columns = [columns]
+    else:
+        n_columns = len(columns)
+        assert all(isinstance(value, (list, tuple)) and len(value) == n_columns for value in mapping.values())
+
+    query = format_query(
+        cr,
+        """
+        UPDATE {table} t
+           SET ({cols}) = ROW({cols_values})
+          FROM JSONB_EACH(%s) m
+         WHERE t.{key_col}::text = m.key
+        """,
+        table=table,
+        cols=ColumnList.from_unquoted(cr, columns),
+        cols_values=SQLStr(
+            ", ".join(
+                "(m.value->>{:d})::{}".format(col_idx, column_type(cr, table, col_name))
+                for col_idx, col_name in enumerate(columns)
+            )
+        ),
+        key_col=key_col,
+    )
+    cr.execute(query, [Json(mapping)])
