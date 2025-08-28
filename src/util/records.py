@@ -34,7 +34,7 @@ from .helpers import (
 from .inconsistencies import break_recursive_loops
 from .indirect_references import indirect_references
 from .inherit import direct_inherit_parents, for_each_inherit
-from .misc import Sentinel, chunks, parse_version, version_gte
+from .misc import AUTOMATIC, chunks, parse_version, version_gte
 from .orm import env, flush
 from .pg import (
     PGRegexp,
@@ -1006,9 +1006,6 @@ def ensure_xmlid_match_record(cr, xmlid, model, values):
     return new_res_id
 
 
-AUTOMATIC = Sentinel("AUTOMATIC")
-
-
 def update_record_from_xml(
     cr,
     xmlid,
@@ -1219,8 +1216,12 @@ def __update_record_from_xml(
                     fields_with_values_from_xml |= {"arch_db", "name"}
             else:
                 fields_with_values_from_xml = fields
+            if version_gte("saas~18.5"):  # translate is varchar
+                sql_code = "SELECT name FROM ir_model_fields WHERE model = %s AND translate IS NOT NULL AND name IN %s"
+            else:  # translate is boolean
+                sql_code = "SELECT name FROM ir_model_fields WHERE model = %s AND translate = true AND name IN %s"
             cr.execute(
-                "SELECT name FROM ir_model_fields WHERE model = %s AND translate = true AND name IN %s",
+                sql_code,
                 [model, tuple(fields_with_values_from_xml)],
             )
             reset_translations = [fname for [fname] in cr.fetchall()]

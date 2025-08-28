@@ -44,7 +44,7 @@ except ImportError:
 
 from .exceptions import MigrationError, SleepyDeveloperError
 from .helpers import _validate_table, model_of_table
-from .misc import Sentinel, log_progress, version_gte
+from .misc import AUTO, Sentinel, log_progress, on_CI, version_gte
 
 _logger = logging.getLogger(__name__)
 
@@ -289,7 +289,15 @@ def explode_query_range(cr, query, table, alias=None, bucket_size=DEFAULT_BUCKET
     cr.execute(format_query(cr, "SELECT min(id), max(id) FROM {}", table))
     min_id, max_id = cr.fetchone()
     if min_id is None:
-        return []  # empty table
+        # empty table
+        if on_CI():
+            # Even if there are any records, return one query to be executed to validate its correctness and avoid
+            # scripts that pass the CI but fail in production.
+            parallel_filter = "{alias}.id IS NOT NULL".format(alias=alias)
+            return [query.format(parallel_filter=parallel_filter)]
+        else:
+            return []
+
     count = (max_id + 1 - min_id) // bucket_size
     if count > MAX_BUCKETS:
         _logger.getChild("explode_query_range").warning(
@@ -1331,16 +1339,37 @@ def drop_depending_views(cr, table, column):
 
 
 def create_m2m(cr, m2m, fk1, fk2, col1=None, col2=None):
+    """
+    Ensure a m2m table exists or is created.
+
+    This function creates the table associated to a m2m field.
+    If the table already exists, :func:`~odoo.upgrade.util.pg.fixup_m2m` is run on it.
+    The table name can be generated automatically, applying the same logic of the ORM.
+    In order to do so, use the value "auto" for the `m2m` parameter.
+
+    :param str m2m: table name to create,
+                    if :const:`~odoo.upgrade.util.misc.AUTO` it is auto-generated
+    :param str fk1: first foreign key table name
+    :param str fk2: second foreign key table name
+    :param str col1: column referencing `fk1`, defaults to `"{fk1}_id"`
+    :param str col2: column referencing `fk2`, defaults to `"{fk2}_id"`
+    :return: the name of the table just created/fixed-up
+    :rtype: str
+    """
     if col1 is None:
         col1 = "%s_id" % fk1
     if col2 is None:
         col2 = "%s_id" % fk2
 
+    if m2m is AUTO:
+        m2m = "{}_{}_rel".format(*sorted([fk1, fk2]))
+
     if table_exists(cr, m2m):
         fixup_m2m(cr, m2m, fk1, fk2, col1, col2)
-        return
+        return m2m
 
-    cr.execute(
+    query = format_query(
+        cr,
         """
         CREATE TABLE {m2m}(
             {col1} integer NOT NULL REFERENCES {fk1}(id) ON DELETE CASCADE,
@@ -1348,8 +1377,16 @@ def create_m2m(cr, m2m, fk1, fk2, col1=None, col2=None):
             PRIMARY KEY ({col1}, {col2})
         );
         CREATE INDEX ON {m2m}({col2}, {col1});
-    """.format(**locals())
+        """,
+        m2m=m2m,
+        col1=col1,
+        col2=col2,
+        fk1=fk1,
+        fk2=fk2,
     )
+    cr.execute(query)
+
+    return m2m
 
 
 def update_m2m_tables(cr, old_table, new_table, ignored_m2ms=()):
