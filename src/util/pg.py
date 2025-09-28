@@ -1296,6 +1296,9 @@ def rename_table(cr, old_table, new_table, remove_constraints=True):
             [new_table, old_table.replace("_", r"\_") + r"\_%"],
         )
         for (const,) in cr.fetchall():
+            if const == f"{old_table}_id_not_null":
+                cr.execute(sql.SQL("ALTER TABLE {} RENAME CONSTRAINT {} TO {}").format(new_table, const, f"{new_table}_id_not_null"))
+                continue
             _logger.info("Dropping constraint %s on table %s", const, new_table)
             remove_constraint(cr, new_table, const, warn=False)
 
