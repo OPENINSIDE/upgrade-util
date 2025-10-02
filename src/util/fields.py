@@ -38,6 +38,12 @@ except ImportError:
         return "%s_%s_index" % (table_name, column_name)
 
 
+try:
+    from odoo.tools import pickle
+except ImportError:
+    import pickle
+
+
 from . import json
 from .const import ENVIRON
 from .domains import _adapt_one_domain, _replace_path, _valid_path_to, adapt_domains
@@ -278,10 +284,10 @@ def remove_field(cr, model, fieldname, cascade=False, drop_column=True, skip_inh
     # remove this field from dependencies of other fields
     if column_exists(cr, "ir_model_fields", "depends"):
         cr.execute(
-            "SELECT id,model,depends FROM ir_model_fields WHERE state='manual' AND depends ~ %s",
+            "SELECT id,model,depends,COALESCE(compute,''),name FROM ir_model_fields WHERE state='manual' AND depends ~ %s",
             [r"\m{}\M".format(fieldname)],
         )
-        for id, from_model, deps in cr.fetchall():
+        for id, from_model, deps, compute_code, dep_field_name in cr.fetchall():
             parts = []
             for part in deps.split(","):
                 path = part.strip().split(".")
@@ -289,6 +295,16 @@ def remove_field(cr, model, fieldname, cascade=False, drop_column=True, skip_inh
                     path[i] == fieldname and _valid_path_to(cr, path[:i], from_model, model) for i in range(len(path))
                 ):
                     parts.append(part)
+                elif fieldname in compute_code:
+                    _logger.warning(
+                        "Field %s.%s depends on removed field %s.%s and its compute code references it, "
+                        "this may lead to errors.",
+                        from_model,
+                        dep_field_name,
+                        model,
+                        fieldname,
+                    )
+
             if len(parts) != len(deps.split(",")):
                 cr.execute("UPDATE ir_model_fields SET depends=%s WHERE id=%s", [", ".join(parts) or None, id])
 
@@ -318,20 +334,6 @@ def remove_field(cr, model, fieldname, cascade=False, drop_column=True, skip_inh
                 "DELETE FROM ir_model_relation r USING ir_model m WHERE m.id = r.model AND r.name = %s", [m2m_rel]
             )
             ENVIRON.setdefault("_gone_m2m", {})[m2m_rel] = "%s:%s" % (model, fieldname)
-
-    # remove the ir.model.fields entry (and its xmlid)
-    cr.execute(
-        """
-            WITH del AS (
-                DELETE FROM ir_model_fields WHERE model=%s AND name=%s RETURNING id
-            )
-            DELETE FROM ir_model_data
-                  USING del
-                  WHERE model = 'ir.model.fields'
-                    AND res_id = del.id
-        """,
-        [model, fieldname],
-    )
 
     # cleanup translations
     if table_exists(cr, "ir_translation"):
@@ -392,6 +394,40 @@ def remove_field(cr, model, fieldname, cascade=False, drop_column=True, skip_inh
     table = table_of_model(cr, model)
     if drop_column and stored:
         remove_column(cr, table, fieldname, cascade=cascade)
+
+    # relation_field_id is a FK with ON DELETE CASCADE
+    if column_exists(cr, "ir_model_fields", "relation_field_id"):
+        cr.execute(
+            """
+            SELECT d.model,
+                   d.name
+              FROM ir_model_fields d
+              JOIN ir_model_fields f
+                ON d.relation_field_id = f.id
+             WHERE f.model = %s
+               AND f.name = %s
+               AND d.ttype = 'one2many'
+               AND d.state = 'manual'
+            """,
+            [model, fieldname],
+        )
+        for rel_model, rel_field in cr.fetchall():
+            _logger.info("Cascade removing one2many field %s.%s", rel_model, rel_field)
+            remove_field(cr, rel_model, rel_field)
+
+    # remove the ir.model.fields entry (and its xmlid)
+    cr.execute(
+        """
+            WITH del AS (
+                DELETE FROM ir_model_fields WHERE model=%s AND name=%s RETURNING id
+            )
+            DELETE FROM ir_model_data
+                  USING del
+                  WHERE model = 'ir.model.fields'
+                    AND res_id = del.id
+        """,
+        [model, fieldname],
+    )
 
     # remove field on inherits
     for inh in for_each_inherit(cr, model, skip_inherit):
@@ -1081,7 +1117,7 @@ if version_gte("16.0"):
     def convert_field_to_translatable(cr, model, field):
         table = table_of_model(cr, model)
         ctype = column_type(cr, table, field)
-        if not ctype or ctype == "json":
+        if not ctype or ctype == "jsonb":
             return
         alter_column_type(cr, table, field, "jsonb", "jsonb_build_object('en_US', {0})")
 
@@ -1186,6 +1222,35 @@ def change_field_selection_values(cr, model, field, mapping, skip_inherit=()):
             """,
             [model, field, [k for k in mapping if k not in mapping.values()]],
         )
+
+    if table_exists(cr, "ir_values"):
+        query = """
+            UPDATE ir_values
+               SET value = %(json)s::jsonb->>value
+             WHERE model = %(model)s
+               AND name = %(name)s
+               AND key = 'default'
+               AND value IN %(keys)s
+        """
+        dumped_map = {pickle.dumps(k): pickle.dumps(v) for k, v in mapping.items()}
+    else:
+        query = """
+            UPDATE ir_default d
+               SET json_value = (%(json)s::jsonb->>d.json_value)
+              FROM ir_model_fields f
+             WHERE d.field_id = f.id
+               AND f.model = %(model)s
+               AND f.name = %(name)s
+               AND d.json_value IN %(keys)s
+        """
+        dumped_map = {json.dumps(k): json.dumps(v) for k, v in mapping.items()}
+    data = {
+        "keys": tuple(dumped_map),
+        "json": json.dumps(dumped_map),
+        "model": model,
+        "name": field,
+    }
+    cr.execute(query, data)
 
     def adapter(leaf, _or, _neg):
         left, op, right = leaf
