@@ -768,6 +768,42 @@ class TestPG(UnitTestCase):
         result = cr.fetchone()[0]
         self.assertEqual(result, expected)
 
+    @parametrize(
+        [
+            ("{parallel_filter}", "…"),
+            ("{{parallel_filter}}", "{parallel_filter}"),
+            ("{}", "{}"),
+            ("{0}", "{0}"),
+            ("{{0}}", "{0}"),
+            ("{x}", "{x}"),
+            ("{{x}}", "{x}"),
+            ("{{}}", "{}"),
+            ("{{", "{"),
+            ("test", "test"),
+            ("", ""),
+            ("WHERE {parallel_filter} AND true", "WHERE … AND true"),
+            ("WHERE {parallel_filter} AND {other}", "WHERE … AND {other}"),
+            ("WHERE {parallel_filter} AND {other!r}", "WHERE … AND {other!r}"),
+            ("WHERE {parallel_filter} AND {{other}}", "WHERE … AND {other}"),
+            ("WHERE {parallel_filter} AND {}", "WHERE … AND {}"),
+            ("WHERE {parallel_filter} AND {{}}", "WHERE … AND {}"),
+            ("WHERE {parallel_filter} AND {parallel_filter}", "WHERE … AND …"),
+            ("using { with other things inside } and {parallel_filter}", "using { with other things inside } and …"),
+        ]
+    )
+    def test_ExplodeFormatter(self, value, expected):
+        formatted = util.pg._ExplodeFormatter().format(value, parallel_filter="…")
+        self.assertEqual(formatted, expected)
+        # retro-compatibility test
+        try:
+            std_formatted = value.format(parallel_filter="…")
+        except (IndexError, KeyError):
+            # ignore string that weren't valid
+            pass
+        else:
+            # assert that the new formatted output match the old one.
+            self.assertEqual(formatted, std_formatted)
+
     def _get_cr(self):
         cr = self.registry.cursor()
         self.addCleanup(cr.close)
@@ -1057,6 +1093,46 @@ class TestPG(UnitTestCase):
         self.assertEqual("res_groups_res_users_rel", auto_generated_m2m_table_name)
         self.assertTrue(util.table_exists(cr, auto_generated_m2m_table_name))
 
+    def test_rename_m2m(self):
+        cr = self.env.cr
+
+        self.env["ir.model"].create({"model": "x_new.model", "name": "Custom test model"})
+        manual_model_id = self.env["ir.model"].create({"model": "x_manual.model", "name": "Manual model"}).id
+
+        field_regular = self.env["ir.model.fields"].create(
+            {
+                "name": "x_m2m_field_regular",
+                "ttype": "many2many",
+                "model_id": manual_model_id,
+                "relation": "x_new.model",
+                "relation_table": "x_x_manual_model_x_new_model_rel",
+            }
+        )
+        field_custom = self.env["ir.model.fields"].create(
+            {
+                "name": "x_m2m_field_custom",
+                "ttype": "many2many",
+                "model_id": manual_model_id,
+                "relation": "x_new.model",
+                "relation_table": "x_x_manual_model_x_new_model_rel_2",
+            }
+        )
+        old_regular_table = field_regular.relation_table
+        old_custom_table = field_custom.relation_table
+
+        util.pg_rename_table(cr, "x_new_model", "new_special_model")
+        util.update_m2m_tables(cr, "x_new_model", "new_special_model")
+        util.invalidate(field_regular)
+
+        new_regular_table = field_regular.relation_table
+        self.assertEqual(new_regular_table, "x_new_special_model_x_manual_model_rel")
+        self.assertEqual(field_custom.relation_table, old_custom_table)
+        self.assertEqual(field_regular.column2, "new_special_model_id")
+        self.assertEqual(field_custom.column2, "new_special_model_id")
+        self.assertTrue(util.table_exists(cr, new_regular_table))
+        self.assertTrue(util.table_exists(cr, old_custom_table))
+        self.assertFalse(util.table_exists(cr, old_regular_table))
+
 
 class TestORM(UnitTestCase):
     def test_create_cron(self):
@@ -1155,6 +1231,65 @@ class TestField(UnitTestCase):
             new_default = self.env["ir.values"].get_default("res.partner", "lang")
 
         self.assertEqual(new_default, "en_US")
+
+    @unittest.skipIf(not util.version_gte("saas~17.5"), "Company dependent fields are stored as jsonb since saas~17.5")
+    def test_convert_field_to_company_dependent(self):
+        cr = self.env.cr
+
+        partner_model = self.env["ir.model"].search([("model", "=", "res.partner")])
+        self.env["ir.model.fields"].create(
+            [
+                {
+                    "name": "x_test_cd_1",
+                    "ttype": "char",
+                    "model_id": partner_model.id,
+                },
+                {
+                    "name": "x_test_cd_2",
+                    "ttype": "char",
+                    "model_id": partner_model.id,
+                },
+            ]
+        )
+
+        c1 = self.env["res.company"].create({"name": "Flancrest"})
+        c2 = self.env["res.company"].create({"name": "Flancrest2"})
+
+        test_partners = self.env["res.partner"].create(
+            [
+                {"name": "Homer", "x_test_cd_1": "A", "x_test_cd_2": "A", "company_id": c1.id},
+                {"name": "Marjorie", "x_test_cd_1": "B", "x_test_cd_2": "B"},
+                {"name": "Bartholomew"},
+            ]
+        )
+        test_partners.invalidate_recordset(["x_test_cd_1", "x_test_cd_2"])
+
+        # Using company_id as default, only records with company set are updated
+        util.make_field_company_dependent(cr, "res.partner", "x_test_cd_1", "char")
+        util.make_field_company_dependent(cr, "res.partner", "x_test_cd_2", "char", company_field=False)
+
+        # make the ORM re-read the info about these manual fields from the DB
+        setup_models = (
+            self.registry.setup_models if hasattr(self.registry, "setup_models") else self.registry._setup_models__
+        )
+        args = (["res.partner"],) if util.version_gte("saas~18.4") else ()
+        setup_models(cr, *args)
+
+        test_partners_c1 = test_partners.with_company(c1.id)
+        self.assertEqual(test_partners_c1[0].x_test_cd_1, "A")
+        self.assertFalse(test_partners_c1[1].x_test_cd_1)
+        self.assertFalse(test_partners_c1[2].x_test_cd_1)
+        self.assertEqual(test_partners_c1[0].x_test_cd_2, "A")
+        self.assertEqual(test_partners_c1[1].x_test_cd_2, "B")
+        self.assertFalse(test_partners_c1[2].x_test_cd_2)
+
+        test_partners_c2 = test_partners.with_company(c2.id)
+        self.assertFalse(test_partners_c2[0].x_test_cd_1)
+        self.assertFalse(test_partners_c2[1].x_test_cd_1)
+        self.assertFalse(test_partners_c2[2].x_test_cd_1)
+        self.assertEqual(test_partners_c2[0].x_test_cd_2, "A")
+        self.assertEqual(test_partners_c2[1].x_test_cd_2, "B")
+        self.assertFalse(test_partners_c2[2].x_test_cd_2)
 
 
 class TestHelpers(UnitTestCase):
