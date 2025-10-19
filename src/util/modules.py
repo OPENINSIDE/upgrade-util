@@ -740,7 +740,8 @@ def _assert_modules_exists(cr, *modules):
     existing_modules = {m[0] for m in cr.fetchall()}
     unexisting_modules = set(modules) - existing_modules
     if unexisting_modules:
-        raise UnknownModuleError(*sorted(unexisting_modules))
+        #raise UnknownModuleError(*sorted(unexisting_modules))
+        _logger.warn("Unknown modules: %s", ", ".join(sorted(unexisting_modules)))
 
 
 @_warn_usage_outside_base
