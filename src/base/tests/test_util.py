@@ -720,18 +720,51 @@ class TestIterBrowse(UnitTestCase):
 class TestPG(UnitTestCase):
     @parametrize(
         [
-            ("res_country", "name", "jsonb" if util.version_gte("16.0") else "varchar"),  # translated field
-            ("res_country", "code", "varchar(2)"),
-            ("res_currency", "active", "bool"),
-            ("res_country", "create_date", "timestamp"),
-            ("res_currency", "create_uid", "int4"),
-            ("res_country", "name_position", "varchar"),
-            ("res_country", "address_format", "text"),
-            ("res_partner", "does_not_exists", None),
+            # explicit conversions
+            ("boolean", "bool"),
+            ("smallint", "int2"),
+            ("integer", "int4"),
+            ("bigint", "int8"),
+            ("real", "float4"),
+            ("double precision", "float8"),
+            ("character varying", "varchar"),
+            ("timestamp with time zone", "timestamptz"),
+            ("timestamp without time zone", "timestamp"),
+            # noop for existing types
+            ("bool", "bool"),
+            ("int4", "int4"),
+            ("varchar", "varchar"),
+            # and unspecified/unknown types
+            ("jsonb", "jsonb"),
+            ("foo", "foo"),
+            # keep suffix (for arrays and sized limited varchar)
+            ("int4[]", "int4[]"),
+            ("varchar(2)", "varchar(2)"),
+            # but also convert types
+            ("integer[]", "int4[]"),
+            ("character varying(16)", "varchar(16)"),
         ]
     )
-    def test_column_type(self, table, column, expected):
-        value = util.column_type(self.env.cr, table, column)
+    def test__normalize_pg_type(self, type_, expected):
+        self.assertEqual(util.pg._normalize_pg_type(type_), expected)
+
+    @parametrize(
+        [
+            ("res_country", "name", False, "jsonb" if util.version_gte("16.0") else "varchar"),  # translated field
+            ("res_country", "code", False, "varchar"),
+            ("res_country", "code", True, "varchar(2)"),
+            ("res_currency", "active", False, "bool"),
+            ("res_currency", "active", True, "bool"),
+            ("res_country", "create_date", False, "timestamp"),
+            ("res_currency", "create_uid", False, "int4"),
+            ("res_country", "name_position", False, "varchar"),
+            ("res_country", "name_position", True, "varchar"),
+            ("res_country", "address_format", False, "text"),
+            ("res_partner", "does_not_exists", False, None),
+        ]
+    )
+    def test_column_type(self, table, column, sized, expected):
+        value = util.column_type(self.env.cr, table, column, sized=sized)
         if expected is None:
             self.assertIsNone(value)
         else:
@@ -762,11 +795,14 @@ class TestPG(UnitTestCase):
             "Some values where not casted correctly via USING",
         )
 
-        self.assertEqual(util.column_type(cr, "res_partner_bank", "y"), "varchar(4)")
+        self.assertEqual(util.column_type(cr, "res_partner_bank", "y"), "varchar")
+        self.assertEqual(util.column_type(cr, "res_partner_bank", "y", sized=True), "varchar(4)")
         util.alter_column_type(cr, "res_partner_bank", "y", "varchar")
         self.assertEqual(util.column_type(cr, "res_partner_bank", "y"), "varchar")
+        self.assertEqual(util.column_type(cr, "res_partner_bank", "y", sized=True), "varchar")
         util.alter_column_type(cr, "res_partner_bank", "y", "varchar(12)")
-        self.assertEqual(util.column_type(cr, "res_partner_bank", "y"), "varchar(12)")
+        self.assertEqual(util.column_type(cr, "res_partner_bank", "y"), "varchar")
+        self.assertEqual(util.column_type(cr, "res_partner_bank", "y", sized=True), "varchar(12)")
 
     @parametrize(
         [
