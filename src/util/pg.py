@@ -438,7 +438,12 @@ def pg_array_uniq(a, drop_null=False):
 
 def pg_replace(s, replacements):
     q = lambda s: psycopg2.extensions.QuotedString(s).getquoted().decode("utf-8")
-    return SQLStr(reduce(lambda s, r: "replace({}, {}, {})".format(s, q(r[0]), q(r[1])), replacements, s))
+
+    def replace(s, r):
+        func = "regexp_replace({}, {}, {}, 'g')" if isinstance(r[0], PGRegexp) else "replace({}, {}, {})"
+        return func.format(s, q(r[0]), q(r[1]))
+
+    return SQLStr(reduce(replace, replacements, s))
 
 
 def pg_html_escape(s, quote=True):
@@ -496,15 +501,15 @@ def get_value_or_en_translation(cr, table, column):
 
 
 def _column_info(cr, table, column):
+    # -> tuple[str, int | None, bool, bool] | None
     _validate_table(table)
-    # NOTE: usage of both `CONCAT` and `||` in the query below is done on purpose to take advantage of their NULL handling.
-    #       NULLS propagate with `||` and are ignored by `CONCAT`.
     cr.execute(
         """
-        SELECT CONCAT(
-                 COALESCE(bt.typname, t.typname),
-                 '(' || information_schema._pg_char_max_length(information_schema._pg_truetypid(a.*, t.*), information_schema._pg_truetypmod(a.*, t.*)) || ')'
-               ) AS udt_name,
+        SELECT COALESCE(bt.typname, t.typname) AS udt_name,
+               information_schema._pg_char_max_length(
+                    information_schema._pg_truetypid(a.*, t.*),
+                   information_schema._pg_truetypmod(a.*, t.*)
+               ) AS char_max_length,
                NOT (a.attnotnull OR t.typtype = 'd' AND t.typnotnull) AS is_nullable,
                (   c.relkind IN ('r','p','v','f')
                AND pg_column_is_updatable(c.oid::regclass, a.attnum, false)
@@ -584,7 +589,7 @@ def column_exists(cr, table, column):
     return _COLUMNS[(table, column)] if (table, column) in _COLUMNS else (_column_info(cr, table, column) is not None)
 
 
-def column_type(cr, table, column):
+def column_type(cr, table, column, sized=False):
     """
     Return the type of a column, if it exists.
 
@@ -593,20 +598,25 @@ def column_type(cr, table, column):
     :rtype: SQL type of the column
     """
     nfo = _column_info(cr, table, column)
+    if not nfo:
+        return None
+    if sized and nfo[1]:
+        return "{}({})".format(nfo[0], nfo[1])
     return nfo[0] if nfo else None
 
 
 def column_nullable(cr, table, column):
     nfo = _column_info(cr, table, column)
-    return nfo and nfo[1]
+    return nfo and nfo[2]
 
 
 def column_updatable(cr, table, column):
     nfo = _column_info(cr, table, column)
-    return nfo and nfo[2]
+    return nfo and nfo[3]
 
 
 def _normalize_pg_type(type_):
+    main_type, suffix = re.match(r"(.+?)((?:\[\]|\([0-9]+\))*)$", type_).groups()
     aliases = {
         "boolean": "bool",
         "smallint": "int2",
@@ -618,7 +628,7 @@ def _normalize_pg_type(type_):
         "timestamp with time zone": "timestamptz",
         "timestamp without time zone": "timestamp",
     }
-    return aliases.get(type_.lower(), type_)
+    return aliases.get(main_type.strip().lower(), main_type) + suffix
 
 
 def create_column(cr, table, column, definition, **kwargs):
@@ -667,7 +677,7 @@ def create_column(cr, table, column, definition, **kwargs):
     if definition == "bool" and default is no_def:
         default = False
 
-    curtype = column_type(cr, table, column)
+    curtype = column_type(cr, table, column, sized=True)
     if curtype:
         if curtype != definition:
             _logger.error("%s.%s already exists but is %r instead of %r", table, column, curtype, definition)
@@ -733,7 +743,7 @@ def alter_column_type(cr, table, column, type, using=None, where=None, logger=_l
         raise ValueError("`where` parameter is only relevant with a non-default `using` parameter")
 
     if not using:
-        current_type = column_type(cr, table, column)
+        current_type = column_type(cr, table, column, sized=True)
         if current_type and current_type == _normalize_pg_type(type):
             logger.info("Column %r of table %r is already defined as %r", column, table, type)
             return
@@ -1883,7 +1893,7 @@ def bulk_update_table(cr, table, columns, mapping, key_col="id"):
         cols=ColumnList.from_unquoted(cr, columns),
         cols_values=SQLStr(
             ", ".join(
-                "(m.value->>{:d})::{}".format(col_idx, column_type(cr, table, col_name))
+                "(m.value->>{:d})::{}".format(col_idx, column_type(cr, table, col_name, sized=True))
                 for col_idx, col_name in enumerate(columns)
             )
         ),
