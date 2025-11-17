@@ -541,7 +541,10 @@ def verify_upgraded_jinja_fields(cr):
                 "Jinja upgrade",
                 format="html",
             )
-        ncr.close()
+        try:
+            ncr.close()
+        except:
+            pass
     cleanup_templates_to_check(cr)
 
 
