@@ -451,7 +451,7 @@ def verify_upgraded_jinja_fields(cr):
     for (table_name,) in cr.fetchall():
         field_errors = {}
         missing_records = []
-        ncr = named_cursor(cr, 100)
+        ncr = named_cursor(cr, 1000)
         ncr.execute(
             """
               SELECT template_type,
