@@ -446,6 +446,8 @@ def upgrade_jinja_fields(
 
 
 def verify_upgraded_jinja_fields(cr):
+    _logger.info("Skipping verification of upgraded jinja fields as it is done in pre-verify-upgraded-jinja-fields.py")
+    return
     env = get_env(cr)
     cr.execute("SELECT DISTINCT(table_name) FROM _upgrade_jinja_to_qweb")
     for (table_name,) in cr.fetchall():
