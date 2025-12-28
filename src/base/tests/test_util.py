@@ -333,10 +333,11 @@ class TestAdaptOneDomain(UnitTestCase):
         self.assertEqual(new_domain, expected)
 
         # test it also works recursively
-        domain = [("partner_id", "any", [("bank_ids", "not any", [("acc_number", "like", "S.A.")])])]
+        account_number = "account_number" if util.version_gte("saas~19.2") else "acc_number"
+        domain = [("partner_id", "any", [("bank_ids", "not any", [(account_number, "like", "S.A.")])])]
         expected = [("partner_id", "any", [("bank_ids", "not any", [("acc_nbr", "like", "S.A.")])])]
 
-        new_domain = _adapt_one_domain(self.cr, "res.partner.bank", "acc_number", "acc_nbr", "res.company", domain)
+        new_domain = _adapt_one_domain(self.cr, "res.partner.bank", account_number, "acc_nbr", "res.company", domain)
         self.assertEqual(new_domain, expected)
 
 
@@ -660,6 +661,19 @@ class TestIterBrowse(UnitTestCase):
                 c.name  # noqa: B018
         expected = (len(ids) + chunk_size - 1) // chunk_size
         self.assertEqual(read.call_count, expected)
+
+    def test_iter_browse_iter_chunks(self):
+        cr = self.env.cr
+        cr.execute("SELECT id FROM res_country")
+        ids = [c for (c,) in cr.fetchall()]
+        chunk_size = 10
+
+        res_chunks = list(
+            util.iter_browse(self.env["res.country"], ids, logger=None, chunk_size=chunk_size, yield_chunks=True)
+        )
+        no_chunks = (len(ids) + chunk_size - 1) // chunk_size
+        self.assertEqual(len(res_chunks), no_chunks)
+        self.assertEqual(len(res_chunks[0]), chunk_size)
 
     def test_iter_browse_call(self):
         cr = self.env.cr
@@ -2599,13 +2613,13 @@ class TestAssertUpdated(UnitTestCase):
         with self.assertUpdated("res_partner", ids=[]):
             p1.city = "Underground"
             util.flush(p1)
-        with self.assertRaises(AssertionError), self.assertUpdated("res_bank", ids=[]):
-            self.env["res.bank"].create({"name": "Annie Leonhart"})
+        with self.assertRaises(AssertionError), self.assertUpdated("res_partner", ids=[]):
+            self.env["res.partner"].create({"name": "Annie Leonhart"})
 
         # when ids has multiple records, all records should be updated
         with self.assertUpdated("res_partner", ids=[p1.id, p2.id]):
-            p1.company_name = "Survey Corps"
-            p2.company_name = "Survey Corps"
+            p1.city = "Survey Corps"
+            p2.city = "Survey Corps"
             util.flush(p1)
             util.flush(p2)
         with self.assertRaises(AssertionError), self.assertUpdated("res_partner", ids=[p1.id, p2.id]):
@@ -2633,20 +2647,20 @@ class TestAssertUpdated(UnitTestCase):
             self.env["res.partner"].create({"name": "Bertolt Hoover"})
 
         # when ids is [], assert no record is updated
-        with self.assertNotUpdated("res_bank", ids=[]):
-            self.env["res.bank"].create({"name": "Marco Bodt"})
+        with self.assertNotUpdated("res_partner", ids=[]):
+            self.env["res.partner"].create({"name": "Marco Bodt"})
         with self.assertRaises(AssertionError), self.assertNotUpdated("res_partner", ids=[]):
             p2.city = "Shiganshina"
             util.flush(p2)
 
         # when ids has a record, only that record should not be updated
         with self.assertNotUpdated("res_partner", ids=[p2.id]):
-            p1.company_name = "Survey Corps"
+            p1.city = "Survey Corps"
             util.flush(p1)
 
         # when ids has multiple records, none of them should be updated
         with self.assertRaises(AssertionError), self.assertNotUpdated("res_partner", ids=[p1.id, p2.id]):
-            p2.company_name = "Survey Corps"
+            p2.city = "Survey Corps"
             util.flush(p2)
 
     def test_assert_updated_combo(self):
@@ -2656,7 +2670,7 @@ class TestAssertUpdated(UnitTestCase):
         util.flush(p2)
 
         with self.assertUpdated("res_partner", ids=[p1.id]), self.assertNotUpdated("res_partner", ids=[p2.id]):
-            p1.company_name = "Marley Warriors"
+            p1.city = "Marley Warriors"
             util.flush(p1)
 
         with self.assertRaises(AssertionError), self.assertUpdated("res_partner"), self.assertNotUpdated(
