@@ -139,7 +139,8 @@ def model_of_table(cr, table):
 
 def _validate_model(model):
     if "_" in model and "." not in model and not model.startswith("x_") and model not in _VALID_MODELS:
-        raise SleepyDeveloperError("`{}` seems to be a table name instead of model name".format(model))
+        #raise SleepyDeveloperError("`{}` seems to be a table name instead of model name".format(model))
+        _logger.warning("`%s` seems to be a table name instead of model name", model)
     return model
 
 
