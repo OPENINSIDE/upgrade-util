@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import uuid
+from collections import OrderedDict  # used for python2 compatibility
 from contextlib import contextmanager
 from operator import itemgetter
 
@@ -12,12 +13,12 @@ from psycopg2 import sql
 from psycopg2.extras import Json, execute_values
 
 try:
-    from odoo import modules, release
+    from odoo import modules
     from odoo.tools.convert import xml_import
     from odoo.tools.misc import file_open
     from odoo.tools.translate import xml_translate
 except ImportError:
-    from openerp import modules, release
+    from openerp import modules
     from openerp.tools.convert import xml_import
     from openerp.tools.misc import file_open
 
@@ -34,7 +35,7 @@ from .helpers import (
 from .inconsistencies import break_recursive_loops
 from .indirect_references import indirect_references
 from .inherit import direct_inherit_parents, for_each_inherit
-from .misc import AUTOMATIC, chunks, parse_version, version_gte
+from .misc import AUTOMATIC, chunks, version_between, version_gte
 from .orm import env, flush
 from .pg import (
     PGRegexp,
@@ -856,6 +857,34 @@ def rename_xmlid(cr, old, new, noupdate=None, on_collision="fail"):
     return None
 
 
+def _refs(cr, *xmlids):
+    if not xmlids:
+        return {}
+
+    for xmlid in xmlids:
+        if "." not in xmlid:
+            raise ValueError("Please use fully qualified name <module>.<name>")
+
+    pairs = list(map(list, zip(*(xmlid.split(".", 1) for xmlid in xmlids))))
+
+    cr.execute(
+        """
+        WITH xmlids AS (
+            SELECT unnest(%s::text[]) AS module,
+                   unnest(%s::text[]) AS name
+        )
+        SELECT xmlids.module || '.' || xmlids.name,
+               res_id
+          FROM xmlids
+     LEFT JOIN ir_model_data imd
+            ON imd.module = xmlids.module
+           AND imd.name = xmlids.name
+        """,
+        pairs,
+    )
+    return dict(cr.fetchall())
+
+
 def ref(cr, xmlid):
     """
     Return the id corresponding to the given :term:`xml_id <external identifier>`.
@@ -864,23 +893,23 @@ def ref(cr, xmlid):
     :return: ID of the referenced record, `None` if not found.
     :rtype: int or None
     """
-    if "." not in xmlid:
-        raise ValueError("Please use fully qualified name <module>.<name>")
+    return _refs(cr, xmlid)[xmlid]
 
-    module, _, name = xmlid.partition(".")
-    cr.execute(
-        """
-            SELECT res_id
-              FROM ir_model_data
-             WHERE module = %s
-               AND name = %s
-    """,
-        [module, name],
-    )
-    data = cr.fetchone()
-    if data:
-        return data[0]
-    return None
+
+def refs(cr, xmlids, strict=False):
+    """
+    Return a mapping of xmlid -> res_id for the given list of xmlids.
+
+    :param list xmlids: list of fully qualified xml_ids, each under the format `module.name`
+    :param bool strict: if ``True``, only include xmlids that exist in the database.
+    :return: dict mapping each xmlid to its res_id; missing xmlids map to ``None`` unless
+             ``strict=True``, in which case they are omitted from the result.
+    :rtype: dict
+    """
+    result = _refs(cr, *xmlids)
+    if strict:
+        return {xmlid: res_id for xmlid, res_id in result.items() if res_id is not None}
+    return result
 
 
 def force_noupdate(cr, xmlid, noupdate=True, warn=False):
@@ -985,7 +1014,7 @@ def ensure_xmlid_match_record(cr, xmlid, model, values):
     new_res_id = records[0]
 
     if data_id:
-        logger.info("update `%s` from %s(%s) to %s(%s); values %r", xmlid, model, new_res_id, model, res_id, values)
+        logger.info("update `%s` from %s(%s) to %s(%s); values %r", xmlid, model, res_id, model, new_res_id, values)
         cr.execute(
             """
                 UPDATE ir_model_data
@@ -1124,9 +1153,7 @@ def __update_record_from_xml(
     )
     xpath = "//*[self::act_window or self::menuitem or self::record or self::report or self::template][{}]".format(id_match)  # fmt: skip
 
-    # use a data tag inside openerp tag to be compatible with all supported versions
-    new_root = lxml.etree.fromstring("<openerp><data/></openerp>")
-
+    roots = OrderedDict()
     manifest = get_manifest(from_module)
     template = False
     found = False
@@ -1145,15 +1172,20 @@ def __update_record_from_xml(
             doc = lxml.etree.parse(fp)
             for node in doc.xpath(xpath):
                 found = True
+                xml_filename = "{}/{}".format(from_module, f)
+                root = roots.get(xml_filename)
+                if root is None:
+                    # use a data tag inside openerp tag to be compatible with all supported versions
+                    root = roots[xml_filename] = lxml.etree.fromstring("<openerp><data/></openerp>")
                 parent = node.getparent()
                 if node.tag == "record" and fields is not None:
                     for fn in node.xpath("./field[@name]"):
                         if fn.attrib["name"] not in fields:
                             node.remove(fn)
-                new_root[0].append(node)
+                root[0].append(node)
 
                 if node.tag == "menuitem" and parent.tag == "menuitem" and "parent_id" not in node.attrib:
-                    new_root[0].append(
+                    root[0].append(
                         lxml.builder.E.record(
                             lxml.builder.E.field(name="parent_id", ref=parent.attrib["id"]),
                             model="ir.ui.menu",
@@ -1198,9 +1230,12 @@ def __update_record_from_xml(
         )
 
     cr_or_env = env(cr) if version_gte("saas~16.2") else cr
-    importer = xml_import(cr_or_env, from_module, idref={}, mode="update")
-    kw = {"mode": "update"} if parse_version("8.0") <= parse_version(release.series) <= parse_version("12.0") else {}
-    importer.parse(new_root, **kw)
+    parse_kw = {"mode": "update"} if version_between("8.0", "12.0") else {}
+    for xml_filename, root in roots.items():
+        kw = {"xml_filename": xml_filename} if version_gte("8.saas~6") else {}
+        importer = xml_import(cr_or_env, from_module, idref={}, mode="update", **kw)
+        importer.parse(root, **parse_kw)
+
     if version_gte("13.0"):
         flush(env(cr)["base"])
 
@@ -1411,7 +1446,7 @@ def delete_unused(cr, *xmlids, **kwargs):
         deleted.extend(res_id_to_xmlid[r] for r in sub_ids if r in res_id_to_xmlid)
 
         if deactivate:
-            deactivate_ids = tuple(set(sub_ids) - set(ids))
+            deactivate_ids = tuple(set(ids) - set(sub_ids))
             if deactivate_ids:
                 cr.execute(format_query(cr, "UPDATE {} SET active = false WHERE id IN %s", table), [deactivate_ids])
 

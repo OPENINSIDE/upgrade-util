@@ -507,6 +507,9 @@ class TestRemoveFieldDomains(UnitTestCase):
         ]
     )
     def test_remove_field(self, domain, expected):
+        self._test_remove_field(domain, expected)
+
+    def _test_remove_field(self, domain, expected, **kw):
         cr = self.env.cr
         cr.execute(
             "INSERT INTO ir_filters(name, model_id, domain, context, sort)"
@@ -515,12 +518,16 @@ class TestRemoveFieldDomains(UnitTestCase):
         )
         (filter_id,) = cr.fetchone()
 
-        util.remove_field(cr, "base.module.update", "updated")
+        util.remove_field(cr, "base.module.update", "updated", **kw)
 
         cr.execute("SELECT domain FROM ir_filters WHERE id = %s", [filter_id])
         altered_domain = literal_eval(cr.fetchone()[0])
 
         self.assertEqual(altered_domain, expected)
+
+    def test_remove_field_no_update_references(self):
+        domain = [("updated", "=", 0)]
+        self._test_remove_field(domain, domain, update_references=False)
 
 
 class TestIrExports(UnitTestCase):
@@ -2621,6 +2628,29 @@ class TestRenameXMLID(UnitTestCase):
         util.invalidate(test_view_2)
         self.assertIn('t-call="base.rename_view"', test_view_2.arch_db)
         self.assertIn('t-name="base.rename_view"', test_view_1.arch_db)
+
+
+class TestRefs(UnitTestCase):
+    def test_refs_found(self):
+        cr = self.env.cr
+        partner_id = util.ref(cr, "base.partner_root")
+        result = util.refs(cr, ["base.partner_root"])
+        self.assertEqual(result, {"base.partner_root": partner_id})
+
+    def test_refs_missing(self):
+        cr = self.env.cr
+        result = util.refs(cr, ["base.no_such_xmlid"])
+        self.assertEqual(result, {"base.no_such_xmlid": None})
+
+    def test_refs_strict_filters_missing(self):
+        cr = self.env.cr
+        partner_id = util.ref(cr, "base.partner_root")
+        result = util.refs(cr, ["base.partner_root", "base.no_such_xmlid"], strict=True)
+        self.assertEqual(result, {"base.partner_root": partner_id})
+
+    def test_refs_empty(self):
+        result = util.refs(self.env.cr, [])
+        self.assertEqual(result, {})
 
 
 class TestAssertUpdated(UnitTestCase):

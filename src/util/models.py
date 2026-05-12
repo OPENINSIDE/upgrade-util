@@ -24,6 +24,7 @@ from .pg import (
     explode_execute,
     explode_query_range,
     format_query,
+    get_fk,
     get_m2m_tables,
     get_value_or_en_translation,
     parallel_execute,
@@ -120,6 +121,7 @@ def remove_model(cr, model, drop_table=True, ignore_m2m=()):
                   JOIN "{}" r ON d.model = %s AND d.res_id = r.id
                  WHERE d.module != '__export__'
                    AND {}
+                GROUP BY d.res_id
             """.format(ir.table, ir.model_filter(prefix="r.")),
             [ref_model, model],
         ).decode()
@@ -286,6 +288,9 @@ def remove_model(cr, model, drop_table=True, ignore_m2m=()):
 
 # compat layer...
 delete_model = remove_model
+"""
+:meta private: exclude from online docs
+"""
 
 
 def _replace_model_in_computed_custom_fields(cr, source, target):
@@ -588,7 +593,9 @@ def merge_model(cr, source, target, drop_table=True, fields_mapping=None, ignore
     remove_model(cr, source, drop_table=drop_table, ignore_m2m=ignore_m2m)
 
 
-def remove_inherit_from_model(cr, model, inherit, keep=(), skip_inherit=(), with_inherit_parents=True):
+def remove_inherit_from_model(
+    cr, model, inherit, keep=(), skip_inherit=(), with_inherit_parents=True, skip_update_references=()
+):
     """
     Remove ``inherit`` from ``model``.
 
@@ -605,9 +612,13 @@ def remove_inherit_from_model(cr, model, inherit, keep=(), skip_inherit=(), with
     :param tuple(str) skip_inherit: list of descendant models of ``model`` to not process
     :param boolean with_inherit_parents: if unset, remove fields coming from ``inherit``
                                          only, keeping all fields from its parents
+    :param tuple(str) or "*" skip_update_references: field names whose references should not be
+                                                     updated upon deletion. Use `"*"` for all fields.
     """
     _validate_model(model)
     _validate_model(inherit)
+
+    logger = _logger.getChild("remote_inherit_from_model")
 
     parents = set(inherit_parents(cr, inherit, interval="[]"))
     inherit_models = {inherit} | (parents if with_inherit_parents else set())
@@ -616,6 +627,7 @@ def remove_inherit_from_model(cr, model, inherit, keep=(), skip_inherit=(), with
         cr.execute("SELECT name FROM ir_model_fields WHERE model IN %s GROUP BY name", [tuple(parents)])
         keep.update(r[0] for r in cr.fetchall())
 
+    irs_done = set()
     cr.execute(
         """
         SELECT name, ttype, relation, store
@@ -640,18 +652,60 @@ def remove_inherit_from_model(cr, model, inherit, keep=(), skip_inherit=(), with
                 and ir.table != "ir_attachment"  # delegated to the `remove_field` call
                 and ir.res_id is not None
                 and not ir.company_dependent_comodel
+                and ir not in irs_done
             ]
             for ir in irs:
+                # if this table has a FK on itself (parent_id), we should break the relation before parallel deletion to avoid
+                # concurrent updates
+                parent_columns = [
+                    fk_col for fk_tbl, fk_col, _, _ in get_fk(cr, ir.table, quote_ident=False) if fk_tbl == ir.table
+                ]
+                for pc in parent_columns:
+                    query = """
+                        UPDATE {table} t
+                           SET {pc} = NULL
+                          FROM {table} p
+                         WHERE p.id = t.{pc}
+                           AND {model_filter}
+                           AND t.{res_model} = p.{res_model}
+                    """
+                    query = format_query(
+                        cr,
+                        query,
+                        table=ir.table,
+                        pc=pc,
+                        model_filter=ir.model_filter(prefix="t."),
+                        res_model=ir.res_model_id if ir.res_model_id else ir.res_model,
+                    )
+                    query = cr.mogrify(query, [model]).decode()
+                    explode_execute(
+                        cr,
+                        query,
+                        table=ir.table,
+                        alias="t",
+                        logger=logger,
+                        qualifier="reset {}.{} update".format(table, pc),
+                    )
+
                 query = cr.mogrify(
                     format_query(cr, "DELETE FROM {} WHERE ({})", ir.table, sql.SQL(ir.model_filter())), [model]
                 ).decode()
-                explode_execute(cr, query, table=table)
-        remove_field(cr, model, field, skip_inherit="*")  # inherits will be removed by the recursive call.
+                explode_execute(cr, query, table=table, logger=logger, qualifier="delete {} queries".format(table))
+                irs_done.add(ir)
+        # skip_inherit set to `*` as inherits will be removed by the recursive call.
+        update_references = False if skip_update_references == "*" else field not in skip_update_references
+        remove_field(cr, model, field, skip_inherit="*", update_references=update_references)
 
     # down on inherits of `model`
     for inh in for_each_inherit(cr, model, skip_inherit):
         remove_inherit_from_model(
-            cr, inh.model, inherit, keep=keep, skip_inherit=skip_inherit, with_inherit_parents=with_inherit_parents
+            cr,
+            inh.model,
+            inherit,
+            keep=keep,
+            skip_inherit=skip_inherit,
+            with_inherit_parents=with_inherit_parents,
+            skip_update_references=skip_update_references,
         )
 
 
