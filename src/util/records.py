@@ -122,7 +122,19 @@ def remove_view(cr, xml_id=None, view_id=None, silent=False, key=None):
 
     if not view_id:
         return
-
+    theme_view_ids = []
+    if table_exists(cr, "theme_ir_ui_view"):
+        cr.execute(
+            """
+            SELECT array_agg(view.id)
+              FROM theme_ir_ui_view theme
+              JOIN ir_ui_view view
+                ON theme.id = view.theme_template_id
+             WHERE theme.inherit_id = 'ir.ui.view,'|| %s
+            """,
+            [view_id],
+        )
+        theme_view_ids = cr.fetchone()[0] or []
     cr.execute(
         """
         SELECT v.id, x.module || '.' || x.name, v.name
@@ -169,10 +181,11 @@ def remove_view(cr, xml_id=None, view_id=None, silent=False, key=None):
 
             disable_view_query = disable_view_query % extra_set_sql
             cr.execute(disable_view_query, (key or xml_id, child_id))
-            add_to_migration_reports(
-                {"id": child_id, "name": child_name},
-                "Disabled views",
-            )
+            if child_id not in theme_view_ids:
+                add_to_migration_reports(
+                    {"id": child_id, "name": child_name},
+                    "Disabled views",
+                )
     if not silent:
         _logger.info("remove deprecated %s view %s (ID %s)", (key and "COWed") or "built-in", key or xml_id, view_id)
 
@@ -1229,7 +1242,16 @@ def __update_record_from_xml(
             done_refs=done_refs,
         )
 
-    cr_or_env = env(cr) if version_gte("saas~16.2") else cr
+    new_env = env(cr)
+
+    if version_gte("saas~15.4"):
+        new_env.invalidate_all()
+    elif version_gte("11.0"):
+        new_env.cache.invalidate()
+    elif version_gte("8.0"):
+        new_env.invalidate_all()
+
+    cr_or_env = new_env if version_gte("saas~16.2") else cr
     parse_kw = {"mode": "update"} if version_between("8.0", "12.0") else {}
     for xml_filename, root in roots.items():
         kw = {"xml_filename": xml_filename} if version_gte("8.saas~6") else {}
@@ -1237,7 +1259,7 @@ def __update_record_from_xml(
         importer.parse(root, **parse_kw)
 
     if version_gte("13.0"):
-        flush(env(cr)["base"])
+        flush(new_env["base"])
 
     if noupdate:
         force_noupdate(cr, xmlid, noupdate=True)

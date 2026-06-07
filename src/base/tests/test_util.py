@@ -701,6 +701,38 @@ class TestIterBrowse(UnitTestCase):
         expected = (len(ids) + chunk_size - 1) // chunk_size
         self.assertEqual(write.call_count, expected)
 
+    def test_iter_browse_ids_gen(self):
+        cr = self.env.cr
+        cr.execute("SELECT id FROM res_country")
+        ids = (c for (c,) in cr.fetchall())
+        ids_len = cr.rowcount
+        chunk_size = 10
+
+        res_chunks = list(
+            util.iter_browse(
+                self.env["res.country"], ids, size=ids_len, logger=None, chunk_size=chunk_size, yield_chunks=True
+            )
+        )
+        no_chunks = (ids_len + chunk_size - 1) // chunk_size
+        self.assertEqual(len(res_chunks), no_chunks)
+        self.assertEqual(len(res_chunks[0]), chunk_size)
+
+    def test_iter_browse_ids_query(self):
+        cr = self.env.cr
+        query = "SELECT id FROM res_country"
+        cr.execute(query)
+        ids_len = cr.rowcount
+        chunk_size = 10
+
+        res_chunks = list(
+            util.iter_browse(
+                self.env["res.country"], None, query=query, logger=None, chunk_size=chunk_size, yield_chunks=True
+            )
+        )
+        no_chunks = (ids_len + chunk_size - 1) // chunk_size
+        self.assertEqual(len(res_chunks), no_chunks)
+        self.assertEqual(len(res_chunks[0]), chunk_size)
+
     def test_iter_browse_create_non_empty(self):
         RP = self.env["res.partner"]
         with self.assertRaises(ValueError):
@@ -715,6 +747,33 @@ class TestIterBrowse(UnitTestCase):
         ib = util.iter_browse(RP, [], chunk_size=chunk_size)
         records = ib.create([{"name": name} for name in names], multi=multi)
         self.assertEqual([t.name for t in records], names)
+
+    @parametrize([(True,), (False,)])
+    def test_iter_browse_create_val_gen(self, multi):
+        chunk_size = 2
+        RP = self.env["res.partner"]
+
+        names = [f"Name {i}" for i in range(7)]
+        ib = util.iter_browse(RP, [], chunk_size=chunk_size)
+        records = ib.create(({"name": name} for name in names), size=7, multi=multi)
+        self.assertEqual([t.name for t in records], names)
+
+    @parametrize([(True,), (False,)])
+    def test_iter_browse_create_val_query(self, multi):
+        with db_connect(self.env.cr.dbname).cursor() as cr, mute_logger("odoo.sql_db"):
+            env = api.Environment(cr, SUPERUSER_ID, {})
+            chunk_size = 2
+            RP = env["res.partner"]
+
+            query = "SELECT 'Name ' || i AS name FROM GENERATE_SERIES(0, 6) AS i"
+            ib = util.iter_browse(RP, [], chunk_size=chunk_size)
+            records = ib.create(query=query, multi=multi)
+            names = []
+            for r in records:
+                names.append(r.name)
+                r.unlink()
+
+        self.assertEqual(names, [f"Name {i}" for i in range(7)])
 
     def test_iter_browse_iter_twice(self):
         cr = self.env.cr
@@ -1652,6 +1711,9 @@ class TestRecords(UnitTestCase):
         # reset all fields on a <template>
         template_xmlid = "base.contact_name"
         record = self.env.ref(template_xmlid)
+        children = record.inherit_children_ids.filtered(lambda v: v.active)
+        children.write({"active": False})
+        self.addCleanup(children.write, {"active": True})
         non_xpath = etree.XPath("/non")
         data_after = {"name": "42", "arch_db": "<non>sense</non>"}
         data_before = {key: record[key] for key in data_after}
@@ -1759,6 +1821,28 @@ class TestRecords(UnitTestCase):
 
         self.assertEqual(usd.symbol, "$")
         self.assertEqual(usd.name, "XXX")
+
+    def test_update_record_from_xml_cache(self):
+        cr = self.env.cr
+        xmlid = "base.action_attachment"
+
+        record_id = util.ref(cr, xmlid)
+        query = "SELECT name FROM ir_act_window WHERE id = %s"
+        if util.column_type(cr, "ir_act_window", "name") == "jsonb":
+            query = "SELECT name->>'en_US' FROM ir_act_window WHERE id = %s"
+
+        cr.execute(query, [record_id])
+        original = cr.fetchone()[0]
+
+        # Load, SQL update, then load shouldn't skip the last load override
+        util.update_record_from_xml(cr, xmlid)
+        cr.execute("""UPDATE ir_act_window SET name = '{"en_US": "hack"}' WHERE id = %s""", [record_id])
+        util.update_record_from_xml(cr, xmlid)
+
+        # Ensure last load restored the value
+
+        cr.execute(query, [record_id])
+        self.assertEqual(cr.fetchone()[0], original)
 
     def test_ensure_xmlid_match_record(self):
         cr = self.env.cr
